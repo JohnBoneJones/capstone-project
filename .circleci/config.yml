@@ -47,6 +47,207 @@ jobs:
             npm run lint
             npm audit fix --audit-level=critical --force
 
+  build-and-push-image:
+    environment:
+        IMAGE_NAME: backendService
+
+    docker:
+      - image: cimg/node:18.16.0
+
+    steps:
+      - checkout
+
+      - setup_remote_docker:
+          version: 19.03.13
+
+      - run:
+          name: Build docker image
+          command: |
+            cd backend
+            sudo docker build --tag=$IMAGE_NAME:latest .
+            sudo docker images ls
+
+      - run:
+          name: Upload Docker image to Dockerhub
+          command: |
+            echo "Docker ID and Image: $IMAGE_NAME"
+            sudo docker login -u="$DOCKERHUB_USERNAME" -p="$DOCKERHUB_PASS"
+            sudo docker tag $IMAGE_NAME $DOCKERHUB_USERNAME/$IMAGE_NAME:latest
+            sudo docker push $DOCKERHUB_USERNAME/$IMAGE_NAME:latest
+
+  deploy-infrastructure:
+    docker:
+      - image: amazon/aws-cli:2.11.20
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: yum install -y tar gzip
+      - run:
+          name: Deploy networking infrastructure
+          command: |
+            pwd
+            cd .circleci
+            aws cloudformation deploy \
+              --template-file cloudformation/network.yml \
+              --stack-name "${ENVIRONMENT_NAME}-eks-network" \
+              --region ${AWS_DEFAULT_REGION} \
+              --parameter-overrides file://cloudformation/network-parameters.json
+      - run:
+          name: Deloy EKS Cluster
+          command: |
+            pwd
+            cd .circleci
+            aws cloudformation deploy \
+              --template-file cloudformation/cluster.yml \
+              --tags project=${ENVIRONMENT_NAME}-project \
+              --stack-name "${ENVIRONMENT_NAME}-eks-cluster" \
+              --region ${AWS_DEFAULT_REGION} \
+              --parameter-overrides file://cloudformation/cluster-parameters.json \
+              --capabilities CAPABILITY_NAMED_IAM
+          no_output_timeout: 15m
+      - run:
+          name: Deploy Nodegroup
+          command: |
+            pwd
+            cd .circleci
+            aws cloudformation deploy \
+              --template-file cloudformation/nodegroup.yml \
+              --tags project=${ENVIRONMENT_NAME}-project \
+              --stack-name "${ENVIRONMENT_NAME}-eks-nodegroup" \
+              --region ${AWS_DEFAULT_REGION} \
+              --parameter-overrides file://cloudformation/nodegroup-parameters.json \
+              --capabilities CAPABILITY_NAMED_IAM
+      - run:
+          name: Deploy management instances
+          command: |
+            pwd
+            cd .circleci
+            aws cloudformation deploy \
+              --template-file cloudformation/management.yml \
+              --tags project=${ENVIRONMENT_NAME}-project \
+              --stack-name "${ENVIRONMENT_NAME}-eks-management" \
+              --region ${AWS_DEFAULT_REGION} \
+              --parameter-overrides file://cloudformation/management-parameters.json \
+              --output text >> ~/deployLog.txt
+            cat ~/deployLog.txt
+      - run:
+          name: Exposing IP of management instance for Ansible
+          command: |
+            pwd
+            cd .circleci
+            echo [management] > ~/inventory.txt
+            aws ec2 describe-instances \
+              --region "${AWS_DEFAULT_REGION}" \
+              --query 'Reservations[*].Instances[*].PublicIpAddress' \
+              --filters "Name=tag:Name,Values=${ENVIRONMENT_NAME}-management*" \
+              --output text >> ~/inventory.txt
+            cat ~/inventory.txt
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - inventory.txt
+            - deployLog.txt
+  
+  configure-infrastructure:
+    docker:
+      - image: python:3.11-rc-alpine
+    steps:
+      - checkout
+      - add_ssh_keys:
+          fingerprints:
+            - "a6:3e:17:3d:0f:c7:3c:85:64:cd:f4:82:94:64:1e:4f"
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Install dependencies
+          command: |
+            apk add --update ansible openssh
+      - run:
+          name: Configure server
+          command: |
+            if grep -q "No changes to deploy" ~/deployLog.txt
+              then
+                cat ~/inventory.txt
+                echo "No change to management instances"
+              else
+                cat ~/inventory.txt
+                cd .circleci/ansible
+                ansible-playbook -i ~/inventory.txt configure-server.yml
+              fi
+
+  configure-cluster:
+    docker:
+      - image: python:3.11-rc-alpine
+    steps:
+      - checkout
+      - add_ssh_keys:
+          fingerprints:
+            - "a6:3e:17:3d:0f:c7:3c:85:64:cd:f4:82:94:64:1e:4f"
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Install dependencies
+          command: |
+            apk add --update ansible openssh
+      - run:
+          name: Configure server
+          command: |
+            if grep -q "No changes to deploy" ~/deployLog.txt
+              then
+                cat ~/inventory.txt
+                echo "No change to management instances"
+              else
+                cat ~/inventory.txt
+                cd .circleci/ansible
+                ansible-playbook -i ~/inventory.txt configure-cluster.yml
+              fi
+      - run:
+          name: Wait for LoadBalancer's go online
+          command: |
+            if grep -q "No changes to deploy" ~/deployLog.txt
+              then
+                cat ~/inventory.txt
+                echo "No change to management instances"
+              else
+                cat ~/inventory.txt
+                echo "Wait 60 seconds..."
+                sleep 60
+              fi
+      - run:
+          name: Display the LoadBalancer's DNS name
+          command: |
+            cat ~/inventory.txt
+            cd .circleci/ansible
+            ansible-playbook -i ~/inventory.txt save-elb-dns.yml
+            cat ~/elb_dns.txt
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - elb_dns.txt
+
+  deploy-docker:
+    docker:
+      - image: python:3.11-rc-alpine
+    steps:
+      - checkout
+      - add_ssh_keys:
+          fingerprints:
+            - "a6:3e:17:3d:0f:c7:3c:85:64:cd:f4:82:94:64:1e:4f"
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Install dependencies
+          command: |
+            apk add --update ansible openssh
+      - run:
+          name: Deploy Docker Image
+          command: |
+            cat ~/inventory.txt
+            cd .circleci/ansible
+            ansible-playbook -i ~/inventory.txt deploy-app.yml
+          no_output_timeout: 2m
+
 # Orchestrate jobs using workflows
 # See: https://circleci.com/docs/configuration-reference/#workflows
 workflows:
@@ -57,3 +258,13 @@ workflows:
           requires: [build-backend]
       - scan-backend:
           requires: [build-backend]
+      - build-and-push-image:
+          requires: [build-backend, test-backend, scan-backend]
+      - deploy-infrastructure:
+          requires: [build-and-push-image]
+      - configure-infrastructure:
+          requires: [deploy-infrastructure]
+      - configure-cluster:
+          requires: [configure-infrastructure]
+      - deploy-docker:
+          requires: [configure-cluster]
