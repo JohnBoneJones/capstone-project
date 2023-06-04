@@ -13,8 +13,8 @@
       args:
         chdir: $HOME
 
-    - name: Copy the output to a local file
-      copy:
-        content: "{{ elb_dns.stdout }}"
-        dest: "~/elb_dns.txt"
-      delegate_to: localhost
+    # - name: Copy the output to a local file
+    #   copy:
+    #     content: "{{ elb_dns.stdout }}"
+    #     dest: "~/elb_dns.txt"
+    #   delegate_to: localhost
