@@ -4,7 +4,7 @@
   user: ubuntu
   gather_facts: false
   become: yes
-  vars:7
+  vars:
     ENVIRONMENT_NAME: "{{ lookup('env', 'ENVIRONMENT_NAME') }}"
   tasks:
     - name: Get the LoadBalancer's DNS name
