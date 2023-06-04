@@ -49,7 +49,7 @@ jobs:
 
   build-and-push-image:
     environment:
-        IMAGE_NAME: backendService
+        IMAGE_NAME: backend-service
 
     docker:
       - image: cimg/node:18.16.0
